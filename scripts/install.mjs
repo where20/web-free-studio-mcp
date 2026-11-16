@@ -118,6 +118,16 @@ function tomlEscape(s) {
   return String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
+/**
+ * 找到从 startIdx 开始的 TOML 段落的结束行号（下一个 [ 标题行）。
+ */
+function sectionEnd(lines, startIdx) {
+  for (let i = startIdx + 1; i < lines.length; i++) {
+    if (lines[i].trim().startsWith("[")) return i;
+  }
+  return lines.length;
+}
+
 /** 只替换 [mcp_servers.<name>] 那一段，不动文件其余部分 */
 function upsertCodexToml(text, entry) {
   const header = `[mcp_servers.${SERVER_NAME}]`;
@@ -125,28 +135,26 @@ function upsertCodexToml(text, entry) {
     header,
     `command = "${tomlEscape(entry.command)}"`,
     `args = [${entry.args.map((a) => `"${tomlEscape(a)}"`).join(", ")}]`,
-    "",
-  ].join("\n");
+  ];
 
   const lines = text.split("\n");
   const start = lines.findIndex((l) => l.trim() === header);
-  if (start === -1) {
-    // 插到最后一个 [mcp_servers.*] 之后，或文件末尾
-    const lastMcp = lines.reduce((acc, l, i) => (l.trim().startsWith("[mcp_servers.") ? i : acc), -1);
-    const at = lastMcp >= 0 ? lastMcp + 1 : lines.length;
-    lines.splice(at, 0, body);
+
+  if (start !== -1) {
+    // 已有 → 整段替换
+    const end = sectionEnd(lines, start);
+    lines.splice(start, end - start, ...body);
     return lines.join("\n");
   }
 
-  // 找这一段的结束（下一个 [ 开头）
-  let end = lines.length;
-  for (let i = start + 1; i < lines.length; i++) {
-    if (lines[i].trim().startsWith("[")) {
-      end = i;
-      break;
-    }
-  }
-  lines.splice(start, end - start, ...body.split("\n").filter((l, i, arr) => !(i === arr.length - 1 && l === "")));
+  // 没有 → 插到「最后一个 mcp_servers 段落的正文结束处」，不能插在它的标题行后面
+  // （那样会把它的 command/args 挤到新标题下面，TOML 会被改坏）
+  const lastTitle = lines.reduce(
+    (acc, l, i) => (l.trim().startsWith("[mcp_servers.") ? i : acc),
+    -1,
+  );
+  const at = lastTitle >= 0 ? sectionEnd(lines, lastTitle) : lines.length;
+  lines.splice(at, 0, ...body, "");
   return lines.join("\n");
 }
 
@@ -155,13 +163,8 @@ function removeCodexToml(text) {
   const lines = text.split("\n");
   const start = lines.findIndex((l) => l.trim() === header);
   if (start === -1) return text;
-  let end = lines.length;
-  for (let i = start + 1; i < lines.length; i++) {
-    if (lines[i].trim().startsWith("[")) {
-      end = i;
-      break;
-    }
-  }
+
+  const end = sectionEnd(lines, start);
   lines.splice(start, end - start);
   return lines.join("\n");
 }

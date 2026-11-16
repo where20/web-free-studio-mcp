@@ -13,14 +13,16 @@ MCP 客户端  →  wfs-mcp (stdio)  →  daemon :8790  →  PabaTV / Veda Studi
 # 1. 写各 agent 的 MCP 配置（自动检测已安装的客户端）
 npx -y github:where20/web-free-studio-mcp install
 
-# 2. 装 daemon 开机自启（macOS launchd）
-npx -y github:where20/web-free-studio-mcp daemon install
-
-# 3. 自检
+# 2. 自检
 npx -y github:where20/web-free-studio-mcp doctor
 ```
 
 > WorkBuddy 用户：写完配置后需在**连接器管理页右上角点「信任」**才会生效。
+
+**daemon 不需要手动启动** —— MCP 适配层会在第一次调用工具时自动把它拉起来
+（这台机器的 `launchctl bootstrap` / `crontab` 都被沙箱禁用，做不了开机自启）。
+想手动起也可以：`cd <web-free-studio> && npm start`。
+可选装开机自启：`npx -y github:where20/web-free-studio-mcp daemon install`（受限环境会失败但不影响使用）。
 
 ## 工具
 

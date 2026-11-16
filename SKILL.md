@@ -125,8 +125,11 @@ wfs_accounts { action: "delete", accountId, purge }  # 删除账号
 ## 换电脑
 
 1. `node scripts/install.mjs` —— 写各 agent 的 MCP 配置
-2. `node scripts/daemon.mjs install` —— 装开机自启
-3. `node scripts/doctor.mjs` —— 自检
+2. `node scripts/doctor.mjs` —— 自检
+
+**daemon 会自动拉起**：MCP 适配层在第一次调用工具时，如果发现 daemon 没跑，会自己把它启动
+（这台机器的 `launchctl` / `crontab` 都被沙箱禁用，做不了开机自启，所以不依赖系统自启机制）。
+如果自动拉起失败，手动执行 `cd <web-free-studio> && npm start`。
 
 **会迁移的**：代码、MCP 配置、产物 assets、任务账本。
 **不会迁移的**：

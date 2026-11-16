@@ -91,11 +91,12 @@ async function main() {
 
   console.log(`\n${C.b}daemon${C.off}`);
   const alive = await isAlive();
-  if (alive) ok(`daemon 在线：${baseUrl()}`);
-  else {
-    bad(`daemon 离线：${baseUrl()}`);
-    console.log(`    ${C.d}启动：cd ${root || "<web-free-studio>"} && npm start${C.off}`);
-    console.log(`    ${C.d}或装开机自启：node scripts/daemon.mjs install${C.off}`);
+  if (alive) {
+    ok(`daemon 在线：${baseUrl()}`);
+  } else {
+    warn(`daemon 离线：${baseUrl()}`);
+    console.log(`    ${C.d}不用手动启动 —— MCP 适配层会在下次调用工具时自动拉起它${C.off}`);
+    console.log(`    ${C.d}若想现在就起：cd ${root || "<web-free-studio>"} && npm start${C.off}`);
   }
 
   if (alive) {
@@ -140,6 +141,7 @@ async function main() {
   console.log(`  ${C.d}· 只有 minimax-h3-flash 是免费模型，选别的会扣积分${C.off}`);
   console.log(`  ${C.d}· Paba 必须走真实浏览器（TLS 指纹 + Turnstile），纯 fetch 会被 403${C.off}`);
   console.log(`  ${C.d}· 单实例：多个 daemon 会互相覆盖本地库，端口被占时先停旧的${C.off}`);
+  console.log(`  ${C.d}· daemon 由 MCP 适配层按需自动拉起（受限环境无法用 launchctl/crontab 自启）${C.off}`);
 
   console.log("");
   if (problems) {

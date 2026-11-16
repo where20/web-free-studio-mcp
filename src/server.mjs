@@ -13,7 +13,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { get, post, del, isAlive, baseUrl } from "./daemon.mjs";
+import { get, post, del, isAlive, ensureDaemon, baseUrl } from "./daemon.mjs";
 import { toDataUrls, toDataUrl, REF_HINT } from "./refs.mjs";
 
 const SERVER_NAME = "web-free-studio";
@@ -86,267 +86,290 @@ async function guard(fn) {
   }
 }
 
+/**
+ * 需要 daemon 的操作统一走这里：daemon 不在就自动拉起。
+ * 这台机器的 launchctl/crontab 都被沙箱禁用，做不了开机自启，
+ * 所以把「起 daemon」这件事交给适配层按需触发。
+ */
+async function withDaemon(fn) {
+  const started = await ensureDaemon();
+  return fn(started);
+}
+
 /* ------------------------------------------------------------------ *
  * 工具实现
  * ------------------------------------------------------------------ */
 
 async function toolStatus() {
-  const alive = await isAlive();
-  if (!alive) {
-    return {
-      isError: true,
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(
-            { error: `daemon 未运行（${baseUrl()}）`, code: "daemon_offline", next: `cd <web-free-studio> && npm start` },
-            null,
-            2,
-          ),
-        },
-      ],
-    };
-  }
-  const [state, veda] = await Promise.all([
-    get("/api/state").catch(() => null),
-    get("/api/veda/state").catch(() => null),
-  ]);
-
-  const out = {
-    daemon: { url: baseUrl(), alive: true },
-    paba: state
-      ? {
-          accounts: (state.accounts || []).map((a) => ({
-            id: a.id,
-            label: a.label,
-            status: a.status,
-            backend: a.backend,
-            disabled: a.disabled,
-            consumedToday: a.usage?.consumed,
-            limit: a.usage?.limit,
-            left: a.usage?.left,
-            active: a.active,
-            needsChallenge: a.needsChallenge,
-            lastError: a.lastError,
-          })),
-          queue: state.queue,
-          models: (state.models || []).map((m) => ({ id: m.id, label: m.label, note: m.note })),
-          limits: state.limits,
-        }
-      : { error: "读取 Paba 状态失败" },
-    veda: veda
-      ? {
-          ok: veda.ok,
-          quota: veda.quota
-            ? {
-                used: veda.quota.used,
-                limit: veda.quota.limit,
-                remaining: veda.quota.remaining,
-                resetsAt: veda.quota.resetsAt,
-                costs: veda.quota.costs,
-              }
-            : null,
-          error: veda.error,
-          local: veda.local ?? null,
-          health: veda.health ?? null,
-          backendOnline: veda.config?.backendOnline,
-          gpu: veda.config?.gpu,
-          numGpus: veda.config?.numGpus,
-        }
-      : { error: "读取 Veda 状态失败" },
-  };
-  return text(out);
-}
-
-async function toolGenerate(args) {
-  const provider = args.provider || "veda";
-  if (provider === "veda") {
-    const body = {
-      prompt: args.prompt,
-      duration: args.duration ?? 5,
-      aspect: args.aspect || "16:9",
-    };
-    if (args.seed != null) body.seed = args.seed;
-    const out = await post("/api/veda/generate", body);
-    return text({
-      provider: "veda",
-      upstreamId: out.upstreamId,
-      deduped: out.deduped,
-      status: out.task?.status,
-      quota: out.quota
-        ? { used: out.quota.used, limit: out.quota.limit, remaining: out.quota.remaining, resetsAt: out.quota.resets_at }
-        : null,
-      note: out.deduped
-        ? "同参数刚提交过，复用了已有任务"
-        : "已提交。Veda 实测 5s/9:16 约需 5–6 分钟出片，请用 wfs_task 轮询",
-    });
-  }
-
-  // paba 通道
-  const body = {
-    prompt: args.prompt,
-    model: args.model || "minimax-h3-flash",
-    mode: args.mode || "text",
-    duration: args.duration ?? 5,
-    resolution: args.resolution || "768p",
-    aspectRatio: args.aspectRatio || "16:9",
-    async: true,
-  };
-  if (args.accountId) body.accountId = args.accountId;
-  if (args.seed != null) body.seed = args.seed;
-
-  if (args.mode === "reference") {
-    body.referenceImages = await toDataUrls(args.referenceImages || []);
-    body.referenceVideos = (await toDataUrls(args.referenceVideos || [])).map((data) => ({ data, withAudio: false }));
-    body.referenceAudios = await toDataUrls(args.referenceAudios || []);
-  } else if (args.mode === "first") {
-    body.firstFrame = await toDataUrl(args.firstFrame);
-  } else if (args.mode === "frames") {
-    body.firstFrame = await toDataUrl(args.firstFrame);
-    body.lastFrame = await toDataUrl(args.lastFrame);
-  }
-
-  const out = await post("/api/generate", body);
-  return text({
-    provider: "paba",
-    jobId: out.jobId,
-    accountId: out.accountId,
-    status: out.status,
-    deduped: out.deduped,
-    note: "已入队。Paba 免费档实测需 10–40 分钟出片，用 wfs_task 查进度",
-  });
-}
-
-async function toolTasks(args) {
-  const q = new URLSearchParams();
-  if (args.provider) q.set("provider", args.provider);
-  if (args.accountId) q.set("accountId", args.accountId);
-  const out = await get(`/api/tasks?${q.toString()}`);
-  const tasks = (out.tasks || []).map(slimTask);
-  return text({
-    count: tasks.length,
-    tasks,
-    hint: "Paba 任务用 upstreamId 查；Veda 任务用 upstreamId 查（本地上游无列表接口，只能靠本地账本）",
-  });
-}
-
-async function toolTask(args) {
-  const id = String(args.upstreamId || "").trim();
-  if (!id) throw new Error("upstreamId 不能为空");
-
-  // 先按上游任务查（本地账本），命中即返回
-  const out = await get(`/api/tasks`);
-  const hit = (out.tasks || []).find((t) => t.upstreamId === id);
-  if (hit) {
-    const s = slimTask(hit);
-    s.videoUrl = hit.asset?.video
-      ? `http://${new URL(baseUrl()).host}${hit.asset.video.replace(/^\/Users\/[^/]+\/Desktop\/REA\/web-free-studio\/data\/assets/, "/assets")}`
-      : null;
-    return text(s);
-  }
-
-  // 本地没有就尝试同步一次（Veda 前进式：主动拉一次上游）
-  await post("/api/veda/sync", {}).catch(() => {});
-  await post("/api/sync", {}).catch(() => {});
-  const again = await get(`/api/tasks`);
-  const hit2 = (again.tasks || []).find((t) => t.upstreamId === id);
-  if (hit2) return text(slimTask(hit2));
-
-  return text({
-    upstreamId: id,
-    found: false,
-    note: "本地账本没有这个任务。Veda 上游无列表接口，历史任务无法回溯；Paba 可在 daemon 里核对账号同步结果",
-  });
-}
-
-async function toolAccounts(args) {
-  const action = args.action || "list";
-  const id = args.accountId;
-
-  if (action === "list") {
-    const state = await get("/api/state");
-    return text({
-      accounts: (state.accounts || []).map((a) => ({
-        id: a.id,
-        label: a.label,
-        status: a.status,
-        backend: a.backend,
-        disabled: a.disabled,
-        consumedToday: a.usage?.consumed,
-        limit: a.usage?.limit,
-        left: a.usage?.left,
-        active: a.active,
-        needsChallenge: a.needsChallenge,
-        lastError: a.lastError,
-      })),
-    });
-  }
-
-  if (!id) throw new Error(`${action} 操作需要 accountId`);
-
-  if (action === "sync") {
-    const out = await post("/api/sync", { accountId: id });
-    return text(out);
-  }
-  if (action === "toggle") {
-    const out = await post(`/api/accounts/${id}/toggle`, { disabled: Boolean(args.disabled) });
-    return text(out);
-  }
-  if (action === "challenge") {
-    const out = await post(`/api/accounts/${id}/challenge`, {});
-    return text(out);
-  }
-  if (action === "delete") {
-    const out = await post(`/api/accounts/${id}/delete`, { purge: Boolean(args.purge) });
-    return text(out);
-  }
-  if (action === "detail") {
-    const out = await get(`/api/accounts/${id}/detail`);
-    return text(out);
-  }
-  if (action === "login") {
-    const out = await post(`/api/accounts/${id}/login`, {});
-    return text(out);
-  }
-  if (action === "cookies") {
-    if (!args.cookies) throw new Error("cookies 操作需要 cookies 数组");
-    const out = await post(`/api/accounts/${id}/cookies`, { cookies: args.cookies });
-    return text(out);
-  }
-  throw new Error(`未知 action：${action}`);
-}
-
-async function toolSync() {
-  const [paba, veda] = await Promise.all([
-    post("/api/sync", {}).catch((e) => ({ error: e.message })),
-    post("/api/veda/sync", {}).catch((e) => ({ error: e.message })),
-  ]);
-  return text({ paba, veda });
-}
-
-async function toolDoctor() {
-  const alive = await isAlive();
-  const out = { daemon: { url: baseUrl(), alive } };
-  if (alive) {
+  return withDaemon(async (started) => {
     const [state, veda] = await Promise.all([
       get("/api/state").catch(() => null),
       get("/api/veda/state").catch(() => null),
     ]);
-    out.paba = { accounts: state?.accounts?.length ?? 0, models: state?.models?.length ?? 0 };
-    out.veda = {
-      ok: veda?.ok ?? false,
-      remaining: veda?.quota?.remaining ?? null,
-      limit: veda?.quota?.limit ?? null,
-      error: veda?.error ?? null,
+
+    const out = {
+      daemon: { url: baseUrl(), alive: true, autoStarted: Boolean(started?.started) },
+      paba: state
+        ? {
+            accounts: (state.accounts || []).map((a) => ({
+              id: a.id,
+              label: a.label,
+              status: a.status,
+              backend: a.backend,
+              disabled: a.disabled,
+              consumedToday: a.usage?.consumed,
+              limit: a.usage?.limit,
+              left: a.usage?.left,
+              active: a.active,
+              needsChallenge: a.needsChallenge,
+              lastError: a.lastError,
+            })),
+            queue: state.queue,
+            models: (state.models || []).map((m) => ({ id: m.id, label: m.label, note: m.note })),
+            limits: state.limits,
+          }
+        : { error: "读取 Paba 状态失败" },
+      veda: veda
+        ? {
+            ok: veda.ok,
+            quota: veda.quota
+              ? {
+                  used: veda.quota.used,
+                  limit: veda.quota.limit,
+                  remaining: veda.quota.remaining,
+                  resetsAt: veda.quota.resetsAt,
+                  costs: veda.quota.costs,
+                }
+              : null,
+            error: veda.error,
+            local: veda.local ?? null,
+            health: veda.health ?? null,
+            backendOnline: veda.config?.backendOnline,
+            gpu: veda.config?.gpu,
+            numGpus: veda.config?.numGpus,
+          }
+        : { error: "读取 Veda 状态失败" },
     };
-  }
-  out.node = process.version;
-  out.hints = [
-    "Node 需要 >= 22",
-    "Paba 通道需要本机 Chrome；沙箱内 spawn Chrome 可能失败，可用「导入 Cookie」方式接入",
-    "Veda 通道是纯 HTTP，不依赖浏览器，但额度按出口 IP 计，换设备无效",
-  ];
-  return text(out);
+    return text(out);
+  });
+}
+
+async function toolGenerate(args) {
+  return withDaemon(async () => {
+    const provider = args.provider || "veda";
+    if (provider === "veda") {
+      const body = {
+        prompt: args.prompt,
+        duration: args.duration ?? 5,
+        aspect: args.aspect || "16:9",
+      };
+      if (args.seed != null) body.seed = args.seed;
+      const out = await post("/api/veda/generate", body);
+      return text({
+        provider: "veda",
+        upstreamId: out.upstreamId,
+        deduped: out.deduped,
+        status: out.task?.status,
+        quota: out.quota
+          ? { used: out.quota.used, limit: out.quota.limit, remaining: out.quota.remaining, resetsAt: out.quota.resets_at }
+          : null,
+        note: out.deduped
+          ? "同参数刚提交过，复用了已有任务"
+          : "已提交。Veda 实测 5s/9:16 约需 5–6 分钟出片，请用 wfs_task 轮询",
+      });
+    }
+
+    // paba 通道
+    const body = {
+      prompt: args.prompt,
+      model: args.model || "minimax-h3-flash",
+      mode: args.mode || "text",
+      duration: args.duration ?? 5,
+      resolution: args.resolution || "768p",
+      aspectRatio: args.aspectRatio || "16:9",
+      async: true,
+    };
+    if (args.accountId) body.accountId = args.accountId;
+    if (args.seed != null) body.seed = args.seed;
+
+    if (args.mode === "reference") {
+      body.referenceImages = await toDataUrls(args.referenceImages || []);
+      body.referenceVideos = (await toDataUrls(args.referenceVideos || [])).map((data) => ({ data, withAudio: false }));
+      body.referenceAudios = await toDataUrls(args.referenceAudios || []);
+    } else if (args.mode === "first") {
+      body.firstFrame = await toDataUrl(args.firstFrame);
+    } else if (args.mode === "frames") {
+      body.firstFrame = await toDataUrl(args.firstFrame);
+      body.lastFrame = await toDataUrl(args.lastFrame);
+    }
+
+    const out = await post("/api/generate", body);
+    return text({
+      provider: "paba",
+      jobId: out.jobId,
+      accountId: out.accountId,
+      status: out.status,
+      deduped: out.deduped,
+      note: "已入队。Paba 免费档实测需 10–40 分钟出片，用 wfs_task 查进度",
+    });
+  });
+}
+
+async function toolTasks(args) {
+  return withDaemon(async () => {
+    const q = new URLSearchParams();
+    if (args.provider) q.set("provider", args.provider);
+    if (args.accountId) q.set("accountId", args.accountId);
+    const out = await get(`/api/tasks?${q.toString()}`);
+    const tasks = (out.tasks || []).map(slimTask);
+    return text({
+      count: tasks.length,
+      tasks,
+      hint: "Paba 任务用 upstreamId 查；Veda 任务用 upstreamId 查（本地上游无列表接口，只能靠本地账本）",
+    });
+  });
+}
+
+async function toolTask(args) {
+  return withDaemon(async () => {
+    const id = String(args.upstreamId || "").trim();
+    if (!id) throw new Error("upstreamId 不能为空");
+
+    // 先按上游任务查（本地账本），命中即返回
+    const out = await get(`/api/tasks`);
+    const hit = (out.tasks || []).find((t) => t.upstreamId === id);
+    if (hit) {
+      const s = slimTask(hit);
+      s.videoUrl = hit.asset?.video ? assetUrl(hit.asset.video) : null;
+      return text(s);
+    }
+
+    // 本地没有就尝试同步一次（Veda 前进式：主动拉一次上游）
+    await post("/api/veda/sync", {}).catch(() => {});
+    await post("/api/sync", {}).catch(() => {});
+    const again = await get(`/api/tasks`);
+    const hit2 = (again.tasks || []).find((t) => t.upstreamId === id);
+    if (hit2) {
+      const s = slimTask(hit2);
+      s.videoUrl = hit2.asset?.video ? assetUrl(hit2.asset.video) : null;
+      return text(s);
+    }
+
+    return text({
+      upstreamId: id,
+      found: false,
+      note: "本地账本没有这个任务。Veda 上游无列表接口，历史任务无法回溯；Paba 可在 daemon 里核对账号同步结果",
+    });
+  });
+}
+
+/** 把 daemon 的绝对资产路径转成可访问的 HTTP 路径 */
+function assetUrl(absPath) {
+  const m = String(absPath).match(/\/data\/assets\/(.+)$/);
+  return m ? `${baseUrl()}/assets/${m[1]}` : null;
+}
+
+async function toolAccounts(args) {
+  return withDaemon(async () => {
+    const action = args.action || "list";
+    const id = args.accountId;
+
+    if (action === "list") {
+      const state = await get("/api/state");
+      return text({
+        accounts: (state.accounts || []).map((a) => ({
+          id: a.id,
+          label: a.label,
+          status: a.status,
+          backend: a.backend,
+          disabled: a.disabled,
+          consumedToday: a.usage?.consumed,
+          limit: a.usage?.limit,
+          left: a.usage?.left,
+          active: a.active,
+          needsChallenge: a.needsChallenge,
+          lastError: a.lastError,
+        })),
+      });
+    }
+
+    if (!id) throw new Error(`${action} 操作需要 accountId`);
+
+    if (action === "sync") {
+      const out = await post("/api/sync", { accountId: id });
+      return text(out);
+    }
+    if (action === "toggle") {
+      const out = await post(`/api/accounts/${id}/toggle`, { disabled: Boolean(args.disabled) });
+      return text(out);
+    }
+    if (action === "challenge") {
+      const out = await post(`/api/accounts/${id}/challenge`, {});
+      return text(out);
+    }
+    if (action === "delete") {
+      const out = await post(`/api/accounts/${id}/delete`, { purge: Boolean(args.purge) });
+      return text(out);
+    }
+    if (action === "detail") {
+      const out = await get(`/api/accounts/${id}/detail`);
+      return text(out);
+    }
+    if (action === "login") {
+      const out = await post(`/api/accounts/${id}/login`, {});
+      return text(out);
+    }
+    if (action === "cookies") {
+      if (!args.cookies) throw new Error("cookies 操作需要 cookies 数组");
+      const out = await post(`/api/accounts/${id}/cookies`, { cookies: args.cookies });
+      return text(out);
+    }
+    throw new Error(`未知 action：${action}`);
+  });
+}
+
+async function toolSync() {
+  return withDaemon(async () => {
+    const [paba, veda] = await Promise.all([
+      post("/api/sync", {}).catch((e) => ({ error: e.message })),
+      post("/api/veda/sync", {}).catch((e) => ({ error: e.message })),
+    ]);
+    return text({ paba, veda });
+  });
+}
+
+async function toolDoctor() {
+  return withDaemon(async (started) => {
+    const [state, veda] = await Promise.all([
+      get("/api/state").catch(() => null),
+      get("/api/veda/state").catch(() => null),
+    ]);
+    const out = {
+      daemon: { url: baseUrl(), alive: true, autoStarted: Boolean(started?.started) },
+      node: process.version,
+      paba: state
+        ? {
+            accounts: state.accounts?.length ?? 0,
+            online: (state.accounts || []).filter((a) => a.status === "online" && !a.disabled).length,
+            models: state.models?.length ?? 0,
+          }
+        : { error: "读取失败" },
+      veda: {
+        ok: veda?.ok ?? false,
+        remaining: veda?.quota?.remaining ?? null,
+        limit: veda?.quota?.limit ?? null,
+        resetsAt: veda?.quota?.resetsAt ?? null,
+        error: veda?.error ?? null,
+      },
+    };
+    out.hints = [
+      "Node 需要 >= 22",
+      "Paba 通道需要本机 Chrome；沙箱内 spawn Chrome 可能失败，可用「导入 Cookie」方式接入",
+      "Veda 通道是纯 HTTP，不依赖浏览器，但额度按出口 IP 计，换设备无效",
+      "daemon 由 MCP 适配层按需自动拉起（launchctl/crontab 在受限环境不可用）",
+    ];
+    return text(out);
+  });
 }
 
 /* ------------------------------------------------------------------ *

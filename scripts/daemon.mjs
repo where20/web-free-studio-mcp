@@ -114,13 +114,30 @@ async function main() {
   if (cmd === "install") {
     await fs.mkdir(path.dirname(PLIST), { recursive: true });
     await fs.writeFile(PLIST, plistContent(root), "utf8");
-    // 先停掉手动跑的实例，否则单实例锁会挡住
+    // 新版 macOS 的 launchctl load 已废弃，用 bootstrap；受限环境会失败
+    let loaded = false;
+    let err = "";
     try {
-      await exec("launchctl", ["unload", PLIST]);
+      await exec("launchctl", ["bootout", `gui/${process.getuid()}/${LABEL}`]);
     } catch {}
-    await exec("launchctl", ["load", "-w", PLIST]);
-    console.log(`✓ 已安装开机自启：${PLIST}`);
-    console.log(`  日志：${path.join(root, "data", "daemon.log")}`);
+    try {
+      await exec("launchctl", ["bootstrap", `gui/${process.getuid()}`, PLIST]);
+      loaded = true;
+    } catch (e) {
+      err = e.stderr?.toString().trim() || e.message;
+    }
+
+    if (loaded) {
+      console.log(`✓ 已安装开机自启：${PLIST}`);
+      console.log(`  日志：${path.join(root, "data", "daemon.log")}`);
+    } else {
+      console.log(`! plist 已写入，但 launchd 加载失败：${err}`);
+      console.log("");
+      console.log(`  不影响使用 —— MCP 适配层会在调用工具时按需自动拉起 daemon，`);
+      console.log(`  所以「开机自启」不是必需的。想要手动起：`);
+      console.log(`    cd ${root} && npm start`);
+      console.log(`  plist 位置：${PLIST}`);
+    }
     console.log("");
     return;
   }
